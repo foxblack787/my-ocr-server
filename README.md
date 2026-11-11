@@ -1,191 +1,219 @@
-# Simple OCR REST API
+Simple OCR Server
 
-A simple REST API for Optical Character Recognition (OCR) using Tesseract, supporting English and Ukrainian languages.
+A lightweight OCR REST API built with Flask, Tesseract OCR, and Pillow.
 
-## Features
+The API extracts text from uploaded images and returns the recognized text along with the detected language, OCR confidence, and word count.
 
-- Extract text from images using Tesseract OCR
-- Support for English and Ukrainian languages
-- Dockerized application
-- RESTful API endpoints
-- Health check endpoint
-- Confidence scoring
-- Error handling and validation
+It supports both raw image uploads (useful for MacroDroid and HTTP clients) and multipart/form-data uploads.
 
-## API Endpoints
+Features
 
-### POST /api/v1/read
-Extract text from an uploaded image.
+- Extract text from images using Tesseract OCR.
+- Supports English ("eng"), Ukrainian ("ukr"), and combined English + Ukrainian ("eng+ukr").
+- Supports raw JPEG and PNG image uploads.
+- Supports multipart/form-data image uploads.
+- Compatible with MacroDroid HTTP Request.
+- Returns OCR confidence and word count.
+- Maximum upload size: 15 MB.
+- JSON responses.
+- Health check endpoint.
+- No API key or authentication required.
 
-**Parameters:**
-- `image` (file, required): Image file to process
-- `language` (form field, optional): Language code - `eng`, `ukr`, or `eng+ukr` (default: `eng`)
+Requirements
 
-**Response:**
-```json
-{
-  "success": true,
-  "text": "Extracted text from image",
-  "language": "eng",
-  "confidence": 95.5,
-  "word_count": 4
-}
-```
+- Python
+- Flask
+- Tesseract OCR
+- pytesseract
+- Pillow
+- Gunicorn (for production deployment)
 
-### GET /health
-Health check endpoint.
+Install Tesseract OCR
 
-**Response:**
-```json
+On Ubuntu or Debian:
+
+sudo apt update
+sudo apt install tesseract-ocr tesseract-ocr-eng tesseract-ocr-ukr
+
+Install Python dependencies
+
+pip install -r requirements.txt
+
+Running the API
+
+Start the application:
+
+python app.py
+
+By default, the application listens on port "8088".
+
+For production, you can use Gunicorn:
+
+gunicorn --bind 0.0.0.0:8088 --workers 2 --timeout 120 app:app
+
+Run the command from the directory containing "app.py".
+
+API Endpoints
+
+1. Health Check
+
+Check whether the API is running.
+
+Endpoint:
+
+GET /health
+
+Example response:
+
 {
   "status": "healthy",
   "message": "OCR API is running"
 }
-```
 
-## Quick Start
+2. Extract Text from an Image
 
-### Using Docker Compose (Recommended)
+Endpoint:
 
-1. Clone or create the project files
-2. Build and run:
-```bash
-docker-compose up --build
-```
+POST /api/v1/read
 
-The API will be available at `http://localhost:5001`
+The API accepts two upload methods.
 
-### Using Docker
+Method 1: Raw Image Upload
 
-1. Build the image:
-```bash
-docker build -t ocr-api .
-```
+Send the image directly as the HTTP request body.
 
-2. Run the container:
-```bash
-docker run -p 5001:5001 ocr-api
-```
+Supported content types:
 
-## Usage Examples
+- "image/jpeg"
+- "image/png"
 
-### Using curl
+The language can be specified using a query parameter.
 
-**Extract English text:**
-```bash
-curl -X POST -F "image=@your_image.jpg" -F "language=eng" http://localhost:5001/api/v1/read
-```
+Example:
 
-**Extract Ukrainian text:**
-```bash
-curl -X POST -F "image=@your_image.jpg" -F "language=ukr" http://localhost:5001/api/v1/read
-```
+POST /api/v1/read?language=eng
+Content-Type: image/jpeg
 
-**Extract both English and Ukrainian:**
-```bash
-curl -X POST -F "image=@your_image.jpg" -F "language=eng+ukr" http://localhost:5001/api/v1/read
-```
+cURL example:
 
-### Using Python requests
+curl -X POST "http://localhost:8088/api/v1/read?language=eng" \
+  -H "Content-Type: image/jpeg" \
+  --data-binary "@image.jpg"
 
-```python
-import requests
+For a PNG image:
 
-# Upload image for OCR
-with open('image.jpg', 'rb') as f:
-    files = {'image': f}
-    data = {'language': 'eng'}
-    response = requests.post('http://localhost:5001/api/v1/read', files=files, data=data)
-    
-print(response.json())
-```
+curl -X POST "http://localhost:8088/api/v1/read?language=eng" \
+  -H "Content-Type: image/png" \
+  --data-binary "@image.png"
 
-### Using JavaScript/Fetch
+MacroDroid Configuration
 
-```javascript
-const formData = new FormData();
-formData.append('image', fileInput.files[0]);
-formData.append('language', 'eng');
+The API supports direct image uploads, making it suitable for MacroDroid.
 
-fetch('http://localhost:5001/api/v1/read', {
-    method: 'POST',
-    body: formData
-})
-.then(response => response.json())
-.then(data => console.log(data));
-```
+Configure the HTTP Request action as follows:
 
-## Docker repo
+Setting| Value
+Method| POST
+URL| Your API address followed by "/api/v1/read?language=eng"
+Content Body| File
+File| Your screenshot file
+Content Type| "image/jpeg"
+Response| JSON
 
-https://hub.docker.com/repository/docker/vitaliikobrin/simple-ocr-server/general
+For PNG screenshots, use "image/png".
 
-## Supported Image Formats
+The API returns the extracted text in the JSON response under the "text" field.
 
-- JPEG/JPG
-- PNG
-- TIFF
-- BMP
-- GIF
+Method 2: Multipart Form Upload
 
-## Configuration
+The API also supports the traditional multipart/form-data method.
 
-The application uses the following environment variables:
+Parameters:
 
-- `PORT`: Server port (default: 5001)
+Parameter| Type| Required| Description
+"image"| File| Yes| Image to process
+"language"| String| No| OCR language; defaults to "eng"
 
-## Error Responses
+cURL example:
 
-The API returns appropriate HTTP status codes and error messages:
+curl -X POST "http://localhost:8088/api/v1/read" \
+  -F "image=@image.jpg" \
+  -F "language=eng"
 
-- `400 Bad Request`: Invalid input (no image, unsupported language, invalid image format)
-- `413 Payload Too Large`: Image file too large
-- `404 Not Found`: Endpoint not found
-- `500 Internal Server Error`: Processing error
+Supported Languages
 
-## Performance Notes
+Language| Code
+English| "eng"
+Ukrainian| "ukr"
+English + Ukrainian| "eng+ukr"
 
-- The API uses Gunicorn with 2 workers for better performance
-- OCR processing time depends on image size and complexity
-- For production use, consider adding request rate limiting
-- Memory usage scales with image size
+You can specify the language through the URL query parameter or the multipart form field.
 
-## Development
+If no language is specified, English ("eng") is used.
 
-### Local Development
+Successful Response
 
-1. Install Python dependencies:
-```bash
-pip install -r requirements.txt
-```
+Example:
 
-2. Install Tesseract:
-```bash
-# Ubuntu/Debian
-sudo apt-get install tesseract-ocr tesseract-ocr-eng tesseract-ocr-ukr
+{
+  "success": true,
+  "text": "The quick brown fox jumps over the lazy dog.",
+  "language": "eng",
+  "confidence": 92.45,
+  "word_count": 9
+}
 
-# macOS
-brew install tesseract tesseract-lang
-```
+Response Fields
 
-3. Run the application:
-```bash
-python app.py
-```
+Field| Type| Description
+"success"| Boolean| Indicates whether OCR processing succeeded
+"text"| String| Extracted text
+"language"| String| OCR language used
+"confidence"| Number| Average OCR confidence score
+"word_count"| Integer| Number of extracted words
 
-### Adding More Languages
+Error Responses
 
-To add support for additional languages:
+The API returns JSON error messages.
 
-1. Install the language pack in the Dockerfile:
-```dockerfile
-tesseract-ocr-[language-code]
-```
+HTTP Status| Description
+"400"| Missing image data, invalid image, or unsupported language
+"404"| Endpoint not found
+"413"| Image exceeds the 15 MB upload limit
+"415"| Unsupported Content-Type for raw image uploads
+"500"| Internal server error
 
-2. Update the supported languages list in `app.py`
+Example:
 
-## Security Considerations
+{
+  "success": false,
+  "error": "Invalid image format"
+}
 
-- The application runs as a non-root user in the container
-- File uploads are validated for image format
-- No permanent file storage (files processed in memory)
-- Consider adding authentication for production use
+OCR Configuration
+
+The current Tesseract configuration is:
+
+OCR_CONFIG = '--oem 3 --psm 6'
+
+- "--oem 3": Uses the default OCR engine mode.
+- "--psm 6": Assumes a single uniform block of text.
+
+Upload Limit
+
+The maximum accepted request size is:
+
+15 MB
+
+Notes
+
+- Raw image uploads must use "image/jpeg" or "image/png".
+- Multipart uploads must include the image under the "image" field.
+- The API does not return image coordinates or bounding boxes.
+- The API returns extracted text and OCR statistics only.
+- Tesseract language data must be installed on the host system.
+- This API currently has no authentication. Do not expose it to untrusted users without considering the security implications.
+
+License
+
+See the repository's "LICENSE" file for licensing information.
