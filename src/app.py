@@ -2,51 +2,117 @@
 from flask import Flask, request, jsonify, g
 import pytesseract
 from PIL import Image, UnidentifiedImageError
-from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
-from datetime import datetime, timezone
-import smtplib
-import ssl
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import dropbox
+from dropbox.files import WriteMode
 import io
 import os
 import logging
 import re
-
+import json
+import uuid
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 # Maximum upload size: 15 MB
-app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
-SUPPORTED_LANGUAGES = ['eng', 'ukr', 'eng+ukr']
-OCR_CONFIG = '--oem 3 --psm 6'
+SUPPORTED_LANGUAGES = ["eng", "ukr", "eng+ukr"]
+OCR_CONFIG = "--oem 3 --psm 6"
 
-# Background email workers
-email_executor = ThreadPoolExecutor(max_workers=2)
+# Dropbox configuration outside the project
+DROPBOX_ENV_FILE = "/home/admin/.dropbox-ocr.env"
+DROPBOX_ROOT = "/OCR"
 
-# Persistent email configuration outside the project
-MAIL_ENV_FILE = '/home/admin/.ocr-mail.env'
+# Germany timezone
+LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 
-# Default recipient if MAIL_TO is not configured
-DEFAULT_MAIL_TO = 'jessyrollsgbjp@gmail.com'
+# Keep today and previous two calendar days
+RETENTION_DAYS = 3
+
+# Background Dropbox workers
+archive_executor = ThreadPoolExecutor(max_workers=2)
 
 
 # --------------------------------------------------
-# Word frequency
+# Environment configuration
+# --------------------------------------------------
+
+def read_env_file(path):
+
+    config = {}
+
+    if not os.path.isfile(path):
+        return config
+
+    with open(path, "r", encoding="utf-8") as file:
+
+        for line in file:
+
+            line = line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+
+            config[key.strip()] = (
+                value.strip().strip('"').strip("'")
+            )
+
+    return config
+
+
+# --------------------------------------------------
+# Dropbox connection
+# --------------------------------------------------
+
+def get_dropbox_client():
+
+    config = read_env_file(DROPBOX_ENV_FILE)
+
+    app_key = (
+        os.environ.get("DROPBOX_APP_KEY")
+        or config.get("DROPBOX_APP_KEY")
+    )
+
+    app_secret = (
+        os.environ.get("DROPBOX_APP_SECRET")
+        or config.get("DROPBOX_APP_SECRET")
+    )
+
+    refresh_token = (
+        os.environ.get("DROPBOX_REFRESH_TOKEN")
+        or config.get("DROPBOX_REFRESH_TOKEN")
+    )
+
+    if not all([app_key, app_secret, refresh_token]):
+
+        raise RuntimeError(
+            "Dropbox configuration is incomplete."
+        )
+
+    return dropbox.Dropbox(
+        oauth2_refresh_token=refresh_token,
+        app_key=app_key,
+        app_secret=app_secret,
+        timeout=30
+    )
+
+
+# --------------------------------------------------
+# Repeated word counting
 # --------------------------------------------------
 
 def count_repeated_words(text):
-    """
-    Count words appearing at least twice.
-    Case-sensitive: UTC and utc are different words.
-    Punctuation is excluded from word matching.
-    """
 
     words = re.findall(
         r"[^\W\d_]+(?:['’][^\W\d_]+)*",
@@ -64,186 +130,242 @@ def count_repeated_words(text):
 
 
 # --------------------------------------------------
-# Email configuration
+# Dropbox folder management
 # --------------------------------------------------
 
-def load_mail_config():
-    """Load email settings from the external env file."""
-
-    config = {}
-
-    if os.path.isfile(MAIL_ENV_FILE):
-        try:
-            with open(MAIL_ENV_FILE, 'r', encoding='utf-8') as file:
-
-                for line in file:
-                    line = line.strip()
-
-                    if not line or line.startswith('#') or '=' not in line:
-                        continue
-
-                    key, value = line.split('=', 1)
-
-                    config[key.strip()] = (
-                        value.strip().strip('"').strip("'")
-                    )
-
-        except Exception:
-            logger.exception("Could not read email configuration")
-
-    # Environment variables override file values
-    for key in [
-        'SMTP_HOST',
-        'SMTP_PORT',
-        'SMTP_USER',
-        'SMTP_PASSWORD',
-        'MAIL_TO'
-    ]:
-        if os.environ.get(key):
-            config[key] = os.environ[key]
-
-    return {
-        'host': config.get('SMTP_HOST', 'smtp.gmail.com'),
-        'port': int(config.get('SMTP_PORT', '587')),
-        'user': config.get('SMTP_USER', ''),
-        'password': config.get('SMTP_PASSWORD', ''),
-        'recipient': config.get('MAIL_TO', DEFAULT_MAIL_TO)
-    }
-
-
-# --------------------------------------------------
-# Email report
-# --------------------------------------------------
-
-def send_email_report(report):
-    """Send OCR report independently in the background."""
+def ensure_dropbox_folder(client, path):
 
     try:
-        config = load_mail_config()
 
-        if not all([
-            config['user'],
-            config['password'],
-            config['recipient']
-        ]):
-            logger.error("Email configuration is incomplete")
-            return
-
-        success = report['success']
-
-        subject = (
-            '✅ OCR Extraction Successful'
-            if success
-            else '❌ OCR Extraction Failed'
+        client.files_create_folder_v2(
+            path,
+            autorename=False
         )
 
-        message = EmailMessage()
-        message['Subject'] = subject
-        message['From'] = config['user']
-        message['To'] = config['recipient']
+    except dropbox.exceptions.ApiError as error:
 
-        body = [
-            'OCR Processing Report',
-            '=====================',
-            '',
-            f"Status: {'SUCCESS' if success else 'FAILED'}",
-            f"Processing time: {report['time']}",
-            f"HTTP status: {report['http_status']}",
-            f"Language: {report.get('language', 'Unknown')}",
-        ]
+        # Existing folder is acceptable
+        if (
+            "conflict" not in str(error).lower()
+            and "already" not in str(error).lower()
+        ):
+            raise
 
-        if success:
 
-            body.extend([
-                '',
-                'Extracted text:',
-                '---------------',
-                report.get('text', ''),
-                '',
-                f"Confidence: {report.get('confidence', 0)}",
-                f"Word count: {report.get('word_count', 0)}",
-                '',
-                'Repeated Words:',
-                '---------------'
-            ])
+# --------------------------------------------------
+# Delete old daily folders
+# --------------------------------------------------
 
-            repeated_words = report.get('repeated_words', {})
+def cleanup_old_daily_folders(client, today):
 
-            if repeated_words:
-                for word, count in repeated_words.items():
-                    body.append(f"{word}: {count}")
-            else:
-                body.append('No repeated words found.')
+    cutoff = today - timedelta(
+        days=RETENTION_DAYS - 1
+    )
+
+    result = client.files_list_folder(DROPBOX_ROOT)
+
+    while True:
+
+        for entry in result.entries:
+
+            if not isinstance(
+                entry,
+                dropbox.files.FolderMetadata
+            ):
+                continue
+
+            try:
+
+                folder_date = datetime.strptime(
+                    entry.name,
+                    "%Y-%m-%d"
+                ).date()
+
+            except ValueError:
+
+                # Ignore folders that are not date folders
+                continue
+
+            if folder_date < cutoff:
+
+                try:
+
+                    client.files_delete_v2(
+                        entry.path_lower or entry.path_display
+                    )
+
+                    logger.info(
+                        "Old Dropbox folder moved to trash: %s",
+                        entry.name
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "Could not clean old Dropbox folder: %s",
+                        entry.name
+                    )
+
+        if not result.has_more:
+            break
+
+        result = client.files_list_folder_continue(
+            result.cursor
+        )
+
+
+# --------------------------------------------------
+# Archive OCR result to Dropbox
+# --------------------------------------------------
+
+def archive_ocr_result(
+    image_bytes,
+    response_data,
+    content_type,
+    started_at
+):
+
+    try:
+
+        client = get_dropbox_client()
+
+        local_started = started_at.astimezone(
+            LOCAL_TIMEZONE
+        )
+
+        day_folder = local_started.strftime(
+            "%Y-%m-%d"
+        )
+
+        operation_id = (
+            local_started.strftime("%H-%M-%S")
+            + "-"
+            + uuid.uuid4().hex[:8]
+        )
+
+        daily_path = (
+            f"{DROPBOX_ROOT}/{day_folder}"
+        )
+
+        operation_path = (
+            f"{daily_path}/{operation_id}"
+        )
+
+        # Create required folders
+        ensure_dropbox_folder(
+            client,
+            DROPBOX_ROOT
+        )
+
+        ensure_dropbox_folder(
+            client,
+            daily_path
+        )
+
+        ensure_dropbox_folder(
+            client,
+            operation_path
+        )
+
+        # Original image filename
+        if content_type == "image/png":
+
+            image_name = "original.png"
 
         else:
 
-            body.extend([
-                '',
-                'Error details:',
-                '--------------',
-                report.get('error', 'Unknown OCR error')
-            ])
+            image_name = "original.jpg"
 
-        message.set_content('\n'.join(body))
+        # TXT file
+        txt_bytes = response_data.get(
+            "text",
+            ""
+        ).encode("utf-8")
 
-        # Attach original JPEG or PNG image
-        image_bytes = report.get('image_bytes')
+        # JSON file
+        json_bytes = json.dumps(
+            response_data,
+            ensure_ascii=False,
+            indent=2
+        ).encode("utf-8")
 
-        if image_bytes:
+        # Upload original image
+        client.files_upload(
+            image_bytes,
+            f"{operation_path}/{image_name}",
+            mode=WriteMode.overwrite,
+            mute=True
+        )
 
-            if image_bytes.startswith(b'\xff\xd8\xff'):
+        # Upload extracted text
+        client.files_upload(
+            txt_bytes,
+            f"{operation_path}/result.txt",
+            mode=WriteMode.overwrite,
+            mute=True
+        )
 
-                message.add_attachment(
-                    image_bytes,
-                    maintype='image',
-                    subtype='jpeg',
-                    filename='original-image.jpg'
-                )
-
-            elif image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-
-                message.add_attachment(
-                    image_bytes,
-                    maintype='image',
-                    subtype='png',
-                    filename='original-image.png'
-                )
-
-        context = ssl.create_default_context()
-
-        with smtplib.SMTP(
-            config['host'],
-            config['port'],
-            timeout=20
-        ) as server:
-
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-
-            password = config['password'].replace(' ', '')
-
-            server.login(config['user'], password)
-            server.send_message(message)
+        # Upload JSON statistics
+        client.files_upload(
+            json_bytes,
+            f"{operation_path}/result.json",
+            mode=WriteMode.overwrite,
+            mute=True
+        )
 
         logger.info(
-            "OCR email report sent successfully to %s",
-            config['recipient']
+            "OCR archive uploaded to Dropbox: %s",
+            operation_path
+        )
+
+        # Clean old folders
+        cleanup_old_daily_folders(
+            client,
+            local_started.date()
         )
 
     except Exception:
-        # Email failure must never affect OCR response
-        logger.exception("Failed to send OCR email report")
+
+        # Dropbox failure must not affect OCR response
+        logger.exception(
+            "Dropbox OCR archive failed"
+        )
 
 
-def submit_email_report(report):
-    """Submit email task without blocking the HTTP response."""
+# --------------------------------------------------
+# Background archive submission
+# --------------------------------------------------
+
+def submit_archive(
+    image_bytes,
+    response_data,
+    content_type,
+    started_at
+):
+
+    if not image_bytes:
+
+        logger.warning(
+            "Dropbox archive skipped: original image bytes are missing"
+        )
+
+        return
 
     try:
-        email_executor.submit(send_email_report, report)
+
+        archive_executor.submit(
+            archive_ocr_result,
+            bytes(image_bytes),
+            dict(response_data),
+            content_type,
+            started_at
+        )
 
     except Exception:
-        logger.exception("Could not schedule email report")
+
+        logger.exception(
+            "Could not schedule Dropbox archive"
+        )
 
 
 # --------------------------------------------------
@@ -251,56 +373,73 @@ def submit_email_report(report):
 # --------------------------------------------------
 
 @app.before_request
-def initialize_ocr_report():
+def initialize_ocr_request():
 
-    if request.path == '/api/v1/read' and request.method == 'POST':
+    if (
+        request.path == "/api/v1/read"
+        and request.method == "POST"
+    ):
 
-        g.ocr_started_at = datetime.now(timezone.utc)
+        g.ocr_started_at = datetime.now(
+            timezone.utc
+        )
+
         g.ocr_image_bytes = None
+
+        g.ocr_content_type = "image/jpeg"
 
 
 @app.after_request
-def schedule_email_after_response(response):
-    """
-    Schedule email after the HTTP response closes.
-    Email sending runs independently.
-    """
+def schedule_dropbox_after_response(response):
 
-    if request.path != '/api/v1/read' or request.method != 'POST':
+    if (
+        request.path != "/api/v1/read"
+        or request.method != "POST"
+    ):
+
         return response
 
     try:
 
-        result = response.get_json(silent=True) or {}
+        result = response.get_json(
+            silent=True
+        ) or {}
+
+        # Archive successful OCR results only
+        if not result.get("success"):
+
+            return response
 
         started_at = getattr(
             g,
-            'ocr_started_at',
+            "ocr_started_at",
             datetime.now(timezone.utc)
         )
 
-        image_bytes = getattr(g, 'ocr_image_bytes', None)
+        image_bytes = getattr(
+            g,
+            "ocr_image_bytes",
+            None
+        )
 
-        report = {
-            'success': bool(result.get('success', False)),
-            'text': result.get('text', ''),
-            'language': result.get('language', 'Unknown'),
-            'confidence': result.get('confidence', 0),
-            'word_count': result.get('word_count', 0),
-            'repeated_words': result.get('repeated_words', {}),
-            'error': result.get('error', 'OCR request failed'),
-            'http_status': response.status_code,
-            'time': started_at.isoformat(),
-            'image_bytes': bytes(image_bytes) if image_bytes else None
-        }
+        content_type = getattr(
+            g,
+            "ocr_content_type",
+            "image/jpeg"
+        )
 
-        # Submit email after response transmission is closed
-        response.call_on_close(
-            lambda report=report: submit_email_report(report)
+        submit_archive(
+            image_bytes,
+            result,
+            content_type,
+            started_at
         )
 
     except Exception:
-        logger.exception("Could not prepare OCR email report")
+
+        logger.exception(
+            "Could not prepare Dropbox archive"
+        )
 
     return response
 
@@ -309,7 +448,7 @@ def schedule_email_after_response(response):
 # Health endpoint
 # --------------------------------------------------
 
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health_check():
 
     return jsonify({
@@ -322,7 +461,7 @@ def health_check():
 # OCR endpoint
 # --------------------------------------------------
 
-@app.route('/api/v1/read', methods=['POST'])
+@app.route("/api/v1/read", methods=["POST"])
 def extract_text():
 
     try:
@@ -331,8 +470,8 @@ def extract_text():
 
         # Language selection
         language = request.args.get(
-            'language',
-            request.form.get('language', 'eng')
+            "language",
+            request.form.get("language", "eng")
         )
 
         if language not in SUPPORTED_LANGUAGES:
@@ -344,11 +483,11 @@ def extract_text():
             }), 400
 
         # Method 1: Multipart upload
-        if 'image' in request.files:
+        if "image" in request.files:
 
-            uploaded_file = request.files['image']
+            uploaded_file = request.files["image"]
 
-            if uploaded_file.filename == '':
+            if uploaded_file.filename == "":
 
                 return jsonify({
                     "success": False,
@@ -369,28 +508,52 @@ def extract_text():
                     "error": "No image data received"
                 }), 400
 
-            # Preserve received bytes before validating content type
-            g.ocr_image_bytes = image_bytes
-
-            content_type = request.mimetype
-
-            if content_type not in ['image/jpeg', 'image/png']:
+            if request.mimetype not in [
+                "image/jpeg",
+                "image/png"
+            ]:
 
                 return jsonify({
                     "success": False,
                     "error": "Content-Type must be image/jpeg or image/png"
                 }), 415
 
-        # Preserve original image for email attachment
+        # Preserve original image bytes in memory
         g.ocr_image_bytes = image_bytes
 
-        # Open and validate image
+        # Detect actual image format
+        if image_bytes.startswith(
+            b"\x89PNG\r\n\x1a\n"
+        ):
+
+            g.ocr_content_type = "image/png"
+
+        elif image_bytes.startswith(
+            b"\xff\xd8\xff"
+        ):
+
+            g.ocr_content_type = "image/jpeg"
+
+        else:
+
+            g.ocr_content_type = (
+                request.mimetype or "image/jpeg"
+            )
+
+        # Validate image
         try:
 
-            image = Image.open(io.BytesIO(image_bytes))
+            image = Image.open(
+                io.BytesIO(image_bytes)
+            )
+
             image.load()
 
-        except (UnidentifiedImageError, OSError, ValueError):
+        except (
+            UnidentifiedImageError,
+            OSError,
+            ValueError
+        ):
 
             return jsonify({
                 "success": False,
@@ -398,8 +561,9 @@ def extract_text():
             }), 400
 
         # Convert image to RGB
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
+        if image.mode != "RGB":
+
+            image = image.convert("RGB")
 
         logger.info(
             "Processing image using language: %s",
@@ -423,38 +587,46 @@ def extract_text():
 
         confidences = [
             int(conf)
-            for conf in data['conf']
+            for conf in data["conf"]
             if int(conf) > 0
         ]
 
         avg_confidence = (
             sum(confidences) / len(confidences)
-            if confidences else 0
+            if confidences
+            else 0
         )
 
         # Count repeated words
-        repeated_words = count_repeated_words(extracted_text)
+        repeated_words = count_repeated_words(
+            extracted_text
+        )
 
-        response = {
+        # Preserve MacroDroid JSON fields
+        result = {
             "success": True,
             "text": extracted_text,
             "language": language,
             "confidence": round(avg_confidence, 2),
-            "word_count": len(extracted_text.split()),
+            "word_count": len(
+                extracted_text.split()
+            ),
             "repeated_words": repeated_words
         }
 
         logger.info(
             "OCR successful. Word count: %s, repeated words: %s",
-            response['word_count'],
-            len(repeated_words)
+            result["word_count"],
+            len(result["repeated_words"])
         )
 
-        return jsonify(response)
+        return jsonify(result)
 
     except Exception:
 
-        logger.exception("OCR processing failed")
+        logger.exception(
+            "OCR processing failed"
+        )
 
         return jsonify({
             "success": False,
@@ -488,12 +660,14 @@ def not_found(error):
 # Application startup
 # --------------------------------------------------
 
-if __name__ == '__main__':
+if __name__ == "__main__":
 
-    port = int(os.environ.get('PORT', 8088))
+    port = int(
+        os.environ.get("PORT", 8088)
+    )
 
     app.run(
-        host='0.0.0.0',
+        host="0.0.0.0",
         port=port,
         debug=False
     )
