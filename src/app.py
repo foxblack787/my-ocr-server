@@ -10,10 +10,6 @@ import ssl
 import io
 import os
 import logging
-import json
-import mimetypes
-import threading
-
 
 app = Flask(__name__)
 
@@ -31,19 +27,18 @@ OCR_CONFIG = '--oem 3 --psm 6'
 # Background email workers
 email_executor = ThreadPoolExecutor(max_workers=2)
 
+# Persistent email configuration outside the project
+MAIL_ENV_FILE = '/home/admin/.ocr-mail.env'
+
 
 # --------------------------------------------------
 # Email configuration
 # --------------------------------------------------
 
-MAIL_ENV_FILE = os.environ.get(
-    'OCR_MAIL_ENV_FILE',
-    '/home/admin/.ocr-mail.env'
-)
-
-
 def load_mail_config():
-    """Load email settings without requiring an external package."""
+    """Load email configuration from the external env file."""
+
+    config = {}
 
     if os.path.isfile(MAIL_ENV_FILE):
         try:
@@ -55,104 +50,112 @@ def load_mail_config():
                         continue
 
                     key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip().strip('"').strip("'")
-
-                    os.environ.setdefault(key, value)
+                    config[key.strip()] = value.strip().strip('"').strip("'")
 
         except Exception:
-            logger.exception("Could not load email configuration")
+            logger.exception("Could not read email configuration")
+
+    # Environment variables override file values
+    for key in [
+        'SMTP_HOST',
+        'SMTP_PORT',
+        'SMTP_USER',
+        'SMTP_PASSWORD',
+        'MAIL_TO'
+    ]:
+        if os.environ.get(key):
+            config[key] = os.environ[key]
 
     return {
-        'host': os.environ.get('SMTP_HOST', 'smtp.gmail.com'),
-        'port': int(os.environ.get('SMTP_PORT', '587')),
-        'user': os.environ.get('SMTP_USER', ''),
-        'password': os.environ.get('SMTP_PASSWORD', ''),
-        'recipient': os.environ.get('MAIL_TO', '')
+        'host': config.get('SMTP_HOST', 'smtp.gmail.com'),
+        'port': int(config.get('SMTP_PORT', '587')),
+        'user': config.get('SMTP_USER', ''),
+        'password': config.get('SMTP_PASSWORD', ''),
+        'recipient': config.get('MAIL_TO', '')
     }
 
 
 # --------------------------------------------------
-# Email sending
+# Email report
 # --------------------------------------------------
 
 def send_email_report(report):
-    """Send an OCR report in a background thread."""
-
-    config = load_mail_config()
-
-    if not all([
-        config['host'],
-        config['user'],
-        config['password'],
-        config['recipient']
-    ]):
-        logger.error("Email settings are incomplete. Report not sent.")
-        return
-
-    success = report.get('success', False)
-
-    subject = (
-        '✅ OCR Extraction Successful'
-        if success
-        else '❌ OCR Extraction Failed'
-    )
-
-    message = EmailMessage()
-    message['Subject'] = subject
-    message['From'] = config['user']
-    message['To'] = config['recipient']
-
-    body = [
-        'OCR Processing Report',
-        '=====================',
-        '',
-        f"Status: {'SUCCESS' if success else 'FAILED'}",
-        f"Processing time: {report.get('time', 'Unknown')}",
-        f"HTTP status: {report.get('http_status', 'Unknown')}",
-        f"Language: {report.get('language', 'Unknown')}",
-    ]
-
-    if success:
-        body.extend([
-            '',
-            'Extracted text:',
-            '---------------',
-            report.get('text', ''),
-            '',
-            f"Confidence: {report.get('confidence', 0)}",
-            f"Word count: {report.get('word_count', 0)}"
-        ])
-    else:
-        body.extend([
-            '',
-            'Error details:',
-            '--------------',
-            report.get('error', 'Unknown OCR error')
-        ])
-
-    message.set_content('\n'.join(body))
-
-    # Attach the original image only if it is JPEG or PNG.
-    image_bytes = report.get('image_bytes')
-
-    if image_bytes:
-        if image_bytes.startswith(b'\xff\xd8\xff'):
-            maintype, subtype, filename = 'image', 'jpeg', 'original-image.jpg'
-        elif image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-            maintype, subtype, filename = 'image', 'png', 'original-image.png'
-        else:
-            maintype = subtype = filename = None
-
-        if maintype:
-            message.add_attachment(
-                image_bytes,
-                maintype=maintype,
-                subtype=subtype,
-                filename=filename
-            )
+    """Send an OCR report in the background."""
 
     try:
+        config = load_mail_config()
+
+        if not all([
+            config['user'],
+            config['password'],
+            config['recipient']
+        ]):
+            logger.error("Email configuration is incomplete")
+            return
+
+        success = report['success']
+
+        subject = (
+            '✅ OCR Extraction Successful'
+            if success
+            else '❌ OCR Extraction Failed'
+        )
+
+        message = EmailMessage()
+        message['Subject'] = subject
+        message['From'] = config['user']
+        message['To'] = config['recipient']
+
+        body = [
+            'OCR Processing Report',
+            '=====================',
+            '',
+            f"Status: {'SUCCESS' if success else 'FAILED'}",
+            f"Processing time: {report['time']}",
+            f"HTTP status: {report['http_status']}",
+            f"Language: {report.get('language', 'Unknown')}",
+        ]
+
+        if success:
+            body.extend([
+                '',
+                'Extracted text:',
+                '---------------',
+                report.get('text', ''),
+                '',
+                f"Confidence: {report.get('confidence', 0)}",
+                f"Word count: {report.get('word_count', 0)}"
+            ])
+        else:
+            body.extend([
+                '',
+                'Error details:',
+                '--------------',
+                report.get('error', 'Unknown OCR error')
+            ])
+
+        message.set_content('\n'.join(body))
+
+        # Attach original JPEG or PNG image
+        image_bytes = report.get('image_bytes')
+
+        if image_bytes:
+            if image_bytes.startswith(b'\xff\xd8\xff'):
+                message.add_attachment(
+                    image_bytes,
+                    maintype='image',
+                    subtype='jpeg',
+                    filename='original-image.jpg'
+                )
+
+            elif image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+                message.add_attachment(
+                    image_bytes,
+                    maintype='image',
+                    subtype='png',
+                    filename='original-image.png'
+                )
+
         context = ssl.create_default_context()
 
         with smtplib.SMTP(
@@ -165,7 +168,6 @@ def send_email_report(report):
             server.starttls(context=context)
             server.ehlo()
 
-            # Remove spaces in Google's displayed app password.
             password = config['password'].replace(' ', '')
 
             server.login(config['user'], password)
@@ -174,24 +176,27 @@ def send_email_report(report):
         logger.info("OCR email report sent successfully")
 
     except Exception:
+        # Email failures must never affect OCR
         logger.exception("Failed to send OCR email report")
 
 
 def submit_email_report(report):
-    """Submit email work without blocking the OCR response."""
+    """Submit email task without blocking the HTTP response."""
 
     try:
         email_executor.submit(send_email_report, report)
+
     except Exception:
-        logger.exception("Could not submit email report")
+        logger.exception("Could not schedule email report")
 
 
 # --------------------------------------------------
-# Capture OCR request information
+# Capture request information
 # --------------------------------------------------
 
 @app.before_request
 def initialize_ocr_report():
+
     if request.path == '/api/v1/read' and request.method == 'POST':
         g.ocr_started_at = datetime.now(timezone.utc)
         g.ocr_image_bytes = None
@@ -200,8 +205,8 @@ def initialize_ocr_report():
 @app.after_request
 def schedule_email_after_response(response):
     """
-    Schedule the report after the HTTP response is closed.
-    The email is sent separately and does not delay MacroDroid.
+    Schedule email after the HTTP response has been closed.
+    The email operation runs independently in the background.
     """
 
     if request.path != '/api/v1/read' or request.method != 'POST':
@@ -224,17 +229,13 @@ def schedule_email_after_response(response):
             'language': result.get('language', 'Unknown'),
             'confidence': result.get('confidence', 0),
             'word_count': result.get('word_count', 0),
-            'error': result.get(
-                'error',
-                'OCR request failed'
-            ),
+            'error': result.get('error', 'OCR request failed'),
             'http_status': response.status_code,
             'time': started_at.isoformat(),
             'image_bytes': bytes(image_bytes) if image_bytes else None
         }
 
-        # WSGI closes the response after transmission.
-        # Only then is the email task submitted.
+        # The email is submitted only after the response closes.
         response.call_on_close(
             lambda report=report: submit_email_report(report)
         )
@@ -251,6 +252,7 @@ def schedule_email_after_response(response):
 
 @app.route('/health', methods=['GET'])
 def health_check():
+
     return jsonify({
         "status": "healthy",
         "message": "OCR API is running"
@@ -263,11 +265,9 @@ def health_check():
 
 @app.route('/api/v1/read', methods=['POST'])
 def extract_text():
+
     try:
         logger.info("OCR request received")
-
-        # Language can be supplied through query parameters
-        # Example: /api/v1/read?language=eng
 
         language = request.args.get(
             'language',
@@ -281,7 +281,7 @@ def extract_text():
                 "supported_languages": SUPPORTED_LANGUAGES
             }), 400
 
-        # Method 1: Multipart form upload
+        # Method 1: Multipart upload
         if 'image' in request.files:
 
             uploaded_file = request.files['image']
@@ -313,7 +313,7 @@ def extract_text():
                     "error": "Content-Type must be image/jpeg or image/png"
                 }), 415
 
-        # Preserve original image bytes for email attachment.
+        # Preserve original image for email attachment
         g.ocr_image_bytes = image_bytes
 
         # Open and validate image
@@ -390,6 +390,7 @@ def extract_text():
 
 @app.errorhandler(413)
 def too_large(error):
+
     return jsonify({
         "success": False,
         "error": "File too large. Maximum size is 15 MB"
@@ -398,6 +399,7 @@ def too_large(error):
 
 @app.errorhandler(404)
 def not_found(error):
+
     return jsonify({
         "success": False,
         "error": "Endpoint not found"
@@ -409,6 +411,7 @@ def not_found(error):
 # --------------------------------------------------
 
 if __name__ == '__main__':
+
     port = int(os.environ.get('PORT', 8088))
 
     app.run(
