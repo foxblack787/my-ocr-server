@@ -4,12 +4,15 @@ import pytesseract
 from PIL import Image, UnidentifiedImageError
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 from datetime import datetime, timezone
 import smtplib
 import ssl
 import io
 import os
 import logging
+import re
+
 
 app = Flask(__name__)
 
@@ -30,19 +33,49 @@ email_executor = ThreadPoolExecutor(max_workers=2)
 # Persistent email configuration outside the project
 MAIL_ENV_FILE = '/home/admin/.ocr-mail.env'
 
+# Default recipient if MAIL_TO is not configured
+DEFAULT_MAIL_TO = 'jessyrollsgbjp@gmail.com'
+
+
+# --------------------------------------------------
+# Word frequency
+# --------------------------------------------------
+
+def count_repeated_words(text):
+    """
+    Count words appearing at least twice.
+    Case-sensitive: UTC and utc are different words.
+    Punctuation is excluded from word matching.
+    """
+
+    words = re.findall(
+        r"[^\W\d_]+(?:['’][^\W\d_]+)*",
+        text,
+        flags=re.UNICODE
+    )
+
+    counts = Counter(words)
+
+    return {
+        word: count
+        for word, count in counts.items()
+        if count >= 2
+    }
+
 
 # --------------------------------------------------
 # Email configuration
 # --------------------------------------------------
 
 def load_mail_config():
-    """Load email configuration from the external env file."""
+    """Load email settings from the external env file."""
 
     config = {}
 
     if os.path.isfile(MAIL_ENV_FILE):
         try:
             with open(MAIL_ENV_FILE, 'r', encoding='utf-8') as file:
+
                 for line in file:
                     line = line.strip()
 
@@ -50,7 +83,10 @@ def load_mail_config():
                         continue
 
                     key, value = line.split('=', 1)
-                    config[key.strip()] = value.strip().strip('"').strip("'")
+
+                    config[key.strip()] = (
+                        value.strip().strip('"').strip("'")
+                    )
 
         except Exception:
             logger.exception("Could not read email configuration")
@@ -71,7 +107,7 @@ def load_mail_config():
         'port': int(config.get('SMTP_PORT', '587')),
         'user': config.get('SMTP_USER', ''),
         'password': config.get('SMTP_PASSWORD', ''),
-        'recipient': config.get('MAIL_TO', '')
+        'recipient': config.get('MAIL_TO', DEFAULT_MAIL_TO)
     }
 
 
@@ -80,7 +116,7 @@ def load_mail_config():
 # --------------------------------------------------
 
 def send_email_report(report):
-    """Send an OCR report in the background."""
+    """Send OCR report independently in the background."""
 
     try:
         config = load_mail_config()
@@ -117,6 +153,7 @@ def send_email_report(report):
         ]
 
         if success:
+
             body.extend([
                 '',
                 'Extracted text:',
@@ -124,9 +161,22 @@ def send_email_report(report):
                 report.get('text', ''),
                 '',
                 f"Confidence: {report.get('confidence', 0)}",
-                f"Word count: {report.get('word_count', 0)}"
+                f"Word count: {report.get('word_count', 0)}",
+                '',
+                'Repeated Words:',
+                '---------------'
             ])
+
+            repeated_words = report.get('repeated_words', {})
+
+            if repeated_words:
+                for word, count in repeated_words.items():
+                    body.append(f"{word}: {count}")
+            else:
+                body.append('No repeated words found.')
+
         else:
+
             body.extend([
                 '',
                 'Error details:',
@@ -140,7 +190,9 @@ def send_email_report(report):
         image_bytes = report.get('image_bytes')
 
         if image_bytes:
+
             if image_bytes.startswith(b'\xff\xd8\xff'):
+
                 message.add_attachment(
                     image_bytes,
                     maintype='image',
@@ -149,6 +201,7 @@ def send_email_report(report):
                 )
 
             elif image_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
+
                 message.add_attachment(
                     image_bytes,
                     maintype='image',
@@ -173,10 +226,13 @@ def send_email_report(report):
             server.login(config['user'], password)
             server.send_message(message)
 
-        logger.info("OCR email report sent successfully")
+        logger.info(
+            "OCR email report sent successfully to %s",
+            config['recipient']
+        )
 
     except Exception:
-        # Email failures must never affect OCR
+        # Email failure must never affect OCR response
         logger.exception("Failed to send OCR email report")
 
 
@@ -198,6 +254,7 @@ def submit_email_report(report):
 def initialize_ocr_report():
 
     if request.path == '/api/v1/read' and request.method == 'POST':
+
         g.ocr_started_at = datetime.now(timezone.utc)
         g.ocr_image_bytes = None
 
@@ -205,14 +262,15 @@ def initialize_ocr_report():
 @app.after_request
 def schedule_email_after_response(response):
     """
-    Schedule email after the HTTP response has been closed.
-    The email operation runs independently in the background.
+    Schedule email after the HTTP response closes.
+    Email sending runs independently.
     """
 
     if request.path != '/api/v1/read' or request.method != 'POST':
         return response
 
     try:
+
         result = response.get_json(silent=True) or {}
 
         started_at = getattr(
@@ -229,13 +287,14 @@ def schedule_email_after_response(response):
             'language': result.get('language', 'Unknown'),
             'confidence': result.get('confidence', 0),
             'word_count': result.get('word_count', 0),
+            'repeated_words': result.get('repeated_words', {}),
             'error': result.get('error', 'OCR request failed'),
             'http_status': response.status_code,
             'time': started_at.isoformat(),
             'image_bytes': bytes(image_bytes) if image_bytes else None
         }
 
-        # The email is submitted only after the response closes.
+        # Submit email after response transmission is closed
         response.call_on_close(
             lambda report=report: submit_email_report(report)
         )
@@ -267,14 +326,17 @@ def health_check():
 def extract_text():
 
     try:
+
         logger.info("OCR request received")
 
+        # Language selection
         language = request.args.get(
             'language',
             request.form.get('language', 'eng')
         )
 
         if language not in SUPPORTED_LANGUAGES:
+
             return jsonify({
                 "success": False,
                 "error": "Unsupported language",
@@ -287,6 +349,7 @@ def extract_text():
             uploaded_file = request.files['image']
 
             if uploaded_file.filename == '':
+
                 return jsonify({
                     "success": False,
                     "error": "No image file selected"
@@ -300,14 +363,19 @@ def extract_text():
             image_bytes = request.get_data()
 
             if not image_bytes:
+
                 return jsonify({
                     "success": False,
                     "error": "No image data received"
                 }), 400
 
+            # Preserve received bytes before validating content type
+            g.ocr_image_bytes = image_bytes
+
             content_type = request.mimetype
 
             if content_type not in ['image/jpeg', 'image/png']:
+
                 return jsonify({
                     "success": False,
                     "error": "Content-Type must be image/jpeg or image/png"
@@ -318,10 +386,12 @@ def extract_text():
 
         # Open and validate image
         try:
+
             image = Image.open(io.BytesIO(image_bytes))
             image.load()
 
         except (UnidentifiedImageError, OSError, ValueError):
+
             return jsonify({
                 "success": False,
                 "error": "Invalid image format"
@@ -332,7 +402,8 @@ def extract_text():
             image = image.convert('RGB')
 
         logger.info(
-            f"Processing image using language: {language}"
+            "Processing image using language: %s",
+            language
         )
 
         # Extract text
@@ -361,21 +432,28 @@ def extract_text():
             if confidences else 0
         )
 
+        # Count repeated words
+        repeated_words = count_repeated_words(extracted_text)
+
         response = {
             "success": True,
             "text": extracted_text,
             "language": language,
             "confidence": round(avg_confidence, 2),
-            "word_count": len(extracted_text.split())
+            "word_count": len(extracted_text.split()),
+            "repeated_words": repeated_words
         }
 
         logger.info(
-            f"OCR successful. Word count: {response['word_count']}"
+            "OCR successful. Word count: %s, repeated words: %s",
+            response['word_count'],
+            len(repeated_words)
         )
 
         return jsonify(response)
 
     except Exception:
+
         logger.exception("OCR processing failed")
 
         return jsonify({
