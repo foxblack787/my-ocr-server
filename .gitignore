@@ -1,2 +1,19 @@
-.idea/
+
+# Python virtual environment
+venv/
 .venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment and secret files
+.env
+.env.*
+*.env
+
+# Test images
+src/test-ocr.png
+
+# Logs
+*.log
