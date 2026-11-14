@@ -22,23 +22,17 @@ logger = logging.getLogger(__name__)
 
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-# Maximum upload size: 15 MB
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 SUPPORTED_LANGUAGES = ["eng", "ukr", "eng+ukr"]
 OCR_CONFIG = "--oem 3 --psm 6"
 
-# Dropbox configuration outside the project
 DROPBOX_ENV_FILE = "/home/admin/.dropbox-ocr.env"
 DROPBOX_ROOT = "/OCR"
 
-# Germany timezone
 LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
-
-# Keep today and previous two calendar days
 RETENTION_DAYS = 3
 
-# Background Dropbox workers
 archive_executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -95,10 +89,7 @@ def get_dropbox_client():
     )
 
     if not all([app_key, app_secret, refresh_token]):
-
-        raise RuntimeError(
-            "Dropbox configuration is incomplete."
-        )
+        raise RuntimeError("Dropbox configuration is incomplete.")
 
     return dropbox.Dropbox(
         oauth2_refresh_token=refresh_token,
@@ -109,10 +100,10 @@ def get_dropbox_client():
 
 
 # --------------------------------------------------
-# Repeated word counting
+# Count ALL words
 # --------------------------------------------------
 
-def count_repeated_words(text):
+def count_all_words(text):
 
     words = re.findall(
         r"[^\W\d_]+(?:['’][^\W\d_]+)*",
@@ -122,9 +113,18 @@ def count_repeated_words(text):
 
     counts = Counter(words)
 
+    return dict(counts)
+
+
+# --------------------------------------------------
+# Count repeated words
+# --------------------------------------------------
+
+def count_repeated_words(word_counts):
+
     return {
         word: count
-        for word, count in counts.items()
+        for word, count in word_counts.items()
         if count >= 2
     }
 
@@ -144,7 +144,6 @@ def ensure_dropbox_folder(client, path):
 
     except dropbox.exceptions.ApiError as error:
 
-        # Existing folder is acceptable
         if (
             "conflict" not in str(error).lower()
             and "already" not in str(error).lower()
@@ -182,8 +181,6 @@ def cleanup_old_daily_folders(client, today):
                 ).date()
 
             except ValueError:
-
-                # Ignore folders that are not date folders
                 continue
 
             if folder_date < cutoff:
@@ -243,46 +240,23 @@ def archive_ocr_result(
             + uuid.uuid4().hex[:8]
         )
 
-        daily_path = (
-            f"{DROPBOX_ROOT}/{day_folder}"
+        daily_path = f"{DROPBOX_ROOT}/{day_folder}"
+        operation_path = f"{daily_path}/{operation_id}"
+
+        ensure_dropbox_folder(client, DROPBOX_ROOT)
+        ensure_dropbox_folder(client, daily_path)
+        ensure_dropbox_folder(client, operation_path)
+
+        image_name = (
+            "original.png"
+            if content_type == "image/png"
+            else "original.jpg"
         )
 
-        operation_path = (
-            f"{daily_path}/{operation_id}"
-        )
-
-        # Create required folders
-        ensure_dropbox_folder(
-            client,
-            DROPBOX_ROOT
-        )
-
-        ensure_dropbox_folder(
-            client,
-            daily_path
-        )
-
-        ensure_dropbox_folder(
-            client,
-            operation_path
-        )
-
-        # Original image filename
-        if content_type == "image/png":
-
-            image_name = "original.png"
-
-        else:
-
-            image_name = "original.jpg"
-
-        # TXT file
         txt_bytes = response_data.get(
-            "text",
-            ""
+            "text", ""
         ).encode("utf-8")
 
-        # JSON file
         json_bytes = json.dumps(
             response_data,
             ensure_ascii=False,
@@ -305,7 +279,7 @@ def archive_ocr_result(
             mute=True
         )
 
-        # Upload JSON statistics
+        # Upload JSON including all word counts
         client.files_upload(
             json_bytes,
             f"{operation_path}/result.json",
@@ -318,7 +292,6 @@ def archive_ocr_result(
             operation_path
         )
 
-        # Clean old folders
         cleanup_old_daily_folders(
             client,
             local_started.date()
@@ -326,7 +299,6 @@ def archive_ocr_result(
 
     except Exception:
 
-        # Dropbox failure must not affect OCR response
         logger.exception(
             "Dropbox OCR archive failed"
         )
@@ -380,12 +352,8 @@ def initialize_ocr_request():
         and request.method == "POST"
     ):
 
-        g.ocr_started_at = datetime.now(
-            timezone.utc
-        )
-
+        g.ocr_started_at = datetime.now(timezone.utc)
         g.ocr_image_bytes = None
-
         g.ocr_content_type = "image/jpeg"
 
 
@@ -401,13 +369,9 @@ def schedule_dropbox_after_response(response):
 
     try:
 
-        result = response.get_json(
-            silent=True
-        ) or {}
+        result = response.get_json(silent=True) or {}
 
-        # Archive successful OCR results only
         if not result.get("success"):
-
             return response
 
         started_at = getattr(
@@ -468,7 +432,6 @@ def extract_text():
 
         logger.info("OCR request received")
 
-        # Language selection
         language = request.args.get(
             "language",
             request.form.get("language", "eng")
@@ -482,7 +445,7 @@ def extract_text():
                 "supported_languages": SUPPORTED_LANGUAGES
             }), 400
 
-        # Method 1: Multipart upload
+        # Multipart upload
         if "image" in request.files:
 
             uploaded_file = request.files["image"]
@@ -496,7 +459,7 @@ def extract_text():
 
             image_bytes = uploaded_file.read()
 
-        # Method 2: Raw image upload (MacroDroid)
+        # Raw image upload from MacroDroid
         else:
 
             image_bytes = request.get_data()
@@ -518,19 +481,14 @@ def extract_text():
                     "error": "Content-Type must be image/jpeg or image/png"
                 }), 415
 
-        # Preserve original image bytes in memory
+        # Preserve image in memory
         g.ocr_image_bytes = image_bytes
 
-        # Detect actual image format
-        if image_bytes.startswith(
-            b"\x89PNG\r\n\x1a\n"
-        ):
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
 
             g.ocr_content_type = "image/png"
 
-        elif image_bytes.startswith(
-            b"\xff\xd8\xff"
-        ):
+        elif image_bytes.startswith(b"\xff\xd8\xff"):
 
             g.ocr_content_type = "image/jpeg"
 
@@ -560,7 +518,7 @@ def extract_text():
                 "error": "Invalid image format"
             }), 400
 
-        # Convert image to RGB
+        # Convert to RGB
         if image.mode != "RGB":
 
             image = image.convert("RGB")
@@ -597,27 +555,31 @@ def extract_text():
             else 0
         )
 
-        # Count repeated words
-        repeated_words = count_repeated_words(
-            extracted_text
-        )
+        # Count every word, including words appearing once
+        word_counts = count_all_words(extracted_text)
 
-        # Preserve MacroDroid JSON fields
+        # Keep repeated_words for backward compatibility
+        repeated_words = count_repeated_words(word_counts)
+
+        # JSON response
         result = {
             "success": True,
             "text": extracted_text,
             "language": language,
             "confidence": round(avg_confidence, 2),
-            "word_count": len(
-                extracted_text.split()
-            ),
+            "word_count": len(extracted_text.split()),
+            "word_counts": word_counts,
             "repeated_words": repeated_words
         }
 
         logger.info(
-            "OCR successful. Word count: %s, repeated words: %s",
-            result["word_count"],
-            len(result["repeated_words"])
+            "OCR successful. Total unique words: %s",
+            len(word_counts)
+        )
+
+        logger.info(
+            "UTC count: %s",
+            word_counts.get("UTC", 0)
         )
 
         return jsonify(result)
